@@ -1,0 +1,42 @@
+## .NET Core
+**/bin/
+**/obj/
+**/out/
+**/appsettings.Development.json
+*.user
+*.secrets
+
+## Visual Studio
+.vs/
+.vscode/
+*.sln.docstates
+*.suo
+*.userprefs
+
+## Neo4j
+**/Storage/
+*.db
+*.db-shm
+*.db-wal
+
+## Logs
+**/logs/
+*.log
+*.tmp
+
+## OS
+.DS_Store
+Thumbs.db
+
+## Build results
+**/build/
+**/[Bb]in/
+**/[Oo]bj/
+
+## Migration tool
+Config/ai-config.local.env
+**/Config/ai-config.local.env
+
+## Temp folders
+temp/
+**/temp/

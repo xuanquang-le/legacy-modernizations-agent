@@ -1,0 +1,19 @@
+{
+  "dependencies": [],
+  "copybookUsage": {
+    "SAMPLE.cbl": []
+  },
+  "reverseDependencies": {},
+  "mermaidDiagram": "graph TB\r\n    subgraph \u0022COBOL Programs\u0022\r\n        P0[\u0022SAMPLE.cbl\u0022]\r\n    end\r\n    subgraph \u0022Copybooks\u0022\r\n    end\r\n    classDef programClass fill:#81c784\r\n    classDef copybookClass fill:#ffb74d\r\n    class P0 programClass\r\n",
+  "analysisInsights": "Dependency insights unavailable: DefaultAzureCredential failed to retrieve a token from the included credentials. See the troubleshooting guide for more information. https://aka.ms/azsdk/net/identity/defaultazurecredential/troubleshoot\r\n- EnvironmentCredential authentication unavailable. Environment variables are not fully configured. See the troubleshooting guide for more information. https://aka.ms/azsdk/net/identity/environmentcredential/troubleshoot\r\n- WorkloadIdentityCredential authentication unavailable. The workload options are not fully configured. See the troubleshooting guide for more information. https://aka.ms/azsdk/net/identity/workloadidentitycredential/troubleshoot\r\n- ManagedIdentityCredential authentication unavailable. No response received from the managed identity endpoint.\r\n- VisualStudioCredential authentication failed: Process \u0022D:\\Program Files\\Microsoft Visual Studio\\18\\Common7\\IDE\\CommonExtensions\\Microsoft\\Asal\\TokenService\\Microsoft.Asal.TokenService.exe\u0022 has failed with unexpected error: TS003: Error, The account is not supported by the provider. The providerId \u0027edadf786-7132-426f-80df-dd1cf206963c\u0027 doesn\u0027t match the expected providerId \u0027552afc90-145a-469c-8c31-943595db4a66\u0027.\r\n- VisualStudioCodeCredential requires the Azure.Identity.Broker package to be referenced from the project. VS Code Azure See the troubleshooting guide for more information. https://aka.ms/azsdk/net/identity/vscodecredential/troubleshoot\r\n- AzureCliCredential authentication failed: Azure CLI not installed\r\n- AzurePowerShellCredential authentication failed: Az.Accounts module \u003E= 2.2.0 is not installed.\r\n- AzureDeveloperCliCredential authentication failed: Azure Developer CLI could not be found.\r\n- The BrokerCredential requires the Azure.Identity.Broker package to be referenced. See the troubleshooting guide for more information. https://aka.ms/azsdk/net/identity/brokercredential/troubleshoot",
+  "metrics": {
+    "totalPrograms": 1,
+    "totalCopybooks": 0,
+    "totalDependencies": 0,
+    "averageDependenciesPerProgram": 0,
+    "mostUsedCopybook": "",
+    "mostUsedCopybookCount": 0,
+    "circularDependencies": []
+  },
+  "createdAt": "2026-03-17T08:14:54.4945919Z"
+}

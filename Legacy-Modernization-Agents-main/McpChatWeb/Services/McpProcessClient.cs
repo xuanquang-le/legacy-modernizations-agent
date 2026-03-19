@@ -1,0 +1,508 @@
+using System.Diagnostics;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using System.Threading;
+using McpChatWeb.Configuration;
+using McpChatWeb.Models;
+using Microsoft.Extensions.Options;
+
+namespace McpChatWeb.Services;
+
+public sealed class McpProcessClient : IMcpClient, IDisposable
+{
+    private readonly SemaphoreSlim _mutex = new(1, 1);
+    private readonly McpOptions _options;
+    private readonly SemaphoreSlim _sendLock = new(1, 1);
+    private Process? _process;
+    private StreamWriter? _stdin;
+    private StreamReader? _stdout;
+    private Task? _stderrDrainer;
+    private long _nextId = 1;
+    private bool _initialized;
+    private bool _disposed;
+
+    public McpProcessClient(IOptions<McpOptions> options)
+    {
+        _options = options.Value;
+        // Register cleanup on app domain unload to prevent zombie processes
+        AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
+    }
+
+    private void OnProcessExit(object? sender, EventArgs e)
+    {
+        Dispose();
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        
+        AppDomain.CurrentDomain.ProcessExit -= OnProcessExit;
+        
+        try
+        {
+            _stdin?.Dispose();
+            _stdout?.Dispose();
+        }
+        catch { /* ignore */ }
+        
+        try
+        {
+            if (_process is { HasExited: false })
+            {
+                _process.Kill(entireProcessTree: true);
+                _process.WaitForExit(1000);
+            }
+            _process?.Dispose();
+        }
+        catch { /* ignore */ }
+        
+        _process = null;
+        _stdin = null;
+        _stdout = null;
+        _stderrDrainer = null;
+        
+        _mutex.Dispose();
+        _sendLock.Dispose();
+    }
+
+    public async Task EnsureReadyAsync(CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        
+        await _mutex.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (_process is not null && !_process.HasExited)
+            {
+                if (!_initialized)
+                {
+                    await InitializeAsync(cancellationToken).ConfigureAwait(false);
+                }
+                return;
+            }
+
+            // Clean up any existing dead process before starting new one
+            if (_process is not null)
+            {
+                try { _process.Kill(entireProcessTree: true); } catch { }
+                try { _process.Dispose(); } catch { }
+                _process = null;
+            }
+
+            await StartProcessAsync(cancellationToken).ConfigureAwait(false);
+            await InitializeAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _mutex.Release();
+        }
+    }
+
+    public async Task<IReadOnlyList<ResourceDto>> ListResourcesAsync(CancellationToken cancellationToken = default)
+    {
+        await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
+        var response = await SendRequestAsync("resources/list", new JsonObject(), cancellationToken).ConfigureAwait(false);
+        var resourcesNode = response["resources"] as JsonArray ?? new JsonArray();
+        var resources = new List<ResourceDto>(resourcesNode.Count);
+        foreach (var item in resourcesNode)
+        {
+            if (item is not JsonObject obj)
+            {
+                continue;
+            }
+
+            var uri = obj["uri"]?.GetValue<string>() ?? string.Empty;
+            var name = obj["name"]?.GetValue<string>() ?? uri;
+            var description = obj["description"]?.GetValue<string>() ?? string.Empty;
+            var mimeType = obj["mimeType"]?.GetValue<string>() ?? "application/json";
+            resources.Add(new ResourceDto(uri, name, description, mimeType));
+        }
+
+        return resources;
+    }
+
+    public async Task<string> ReadResourceAsync(string uri, CancellationToken cancellationToken = default)
+    {
+        await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
+
+        var parameters = new JsonObject
+        {
+            ["uri"] = uri
+        };
+
+        var response = await SendRequestAsync("resources/read", parameters, cancellationToken).ConfigureAwait(false);
+
+        if (response.TryGetPropertyValue("contents", out var contentsNode) && contentsNode is JsonArray contentsArray && contentsArray.Count > 0)
+        {
+            if (contentsArray[0] is JsonObject contentObj && contentObj.TryGetPropertyValue("text", out var textNode))
+            {
+                return textNode?.GetValue<string>() ?? string.Empty;
+            }
+        }
+
+        return string.Empty;
+    }
+
+    public async Task<string> SendChatAsync(string prompt, CancellationToken cancellationToken = default)
+    {
+        await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
+
+        var messages = new JsonArray
+        {
+            new JsonObject
+            {
+                ["role"] = "system",
+                ["content"] = new JsonArray(new JsonObject
+                {
+                    ["type"] = "text",
+                    ["text"] = "You are a helpful assistant that answers questions about COBOL migration runs. You have access to reverse engineering results including business purpose, user stories, features, and business rules extracted from the COBOL source files. Use this context to give accurate, specific answers about what the programs do and how they work."
+                })
+            },
+            new JsonObject
+            {
+                ["role"] = "user",
+                ["content"] = new JsonArray(new JsonObject
+                {
+                    ["type"] = "text",
+                    ["text"] = prompt
+                })
+            }
+        };
+
+        var parameters = new JsonObject
+        {
+            ["model"] = "cobol-migration-insights",
+            ["messages"] = messages
+        };
+
+        var response = await SendRequestAsync("messages/create", parameters, cancellationToken).ConfigureAwait(false);
+        var contentNode = response["content"] as JsonArray;
+        if (contentNode is null || contentNode.Count == 0)
+        {
+            return "No response from MCP server.";
+        }
+
+        foreach (var item in contentNode)
+        {
+            if (item is JsonObject obj && obj["type"]?.GetValue<string>() == "text")
+            {
+                return obj["text"]?.GetValue<string>() ?? string.Empty;
+            }
+        }
+
+        return contentNode[0]?.ToJsonString() ?? string.Empty;
+    }
+
+    public async Task<JsonObject> CallToolAsync(string name, Dictionary<string, object> arguments, CancellationToken cancellationToken = default)
+    {
+        await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
+
+        var argsNode = new JsonObject();
+        foreach (var kvp in arguments)
+        {
+            if (kvp.Value is JsonElement je)
+            {
+                argsNode[kvp.Key] = JsonNode.Parse(je.GetRawText());
+            }
+            else if (kvp.Value is string s)
+            {
+                argsNode[kvp.Key] = s;
+            }
+            else if (kvp.Value is int i)
+            {
+                argsNode[kvp.Key] = i;
+            }
+            else if (kvp.Value is bool b)
+            {
+                argsNode[kvp.Key] = b;
+            }
+            else if (kvp.Value is null)
+            {
+                argsNode[kvp.Key] = null;
+            }
+            else
+            {
+                argsNode[kvp.Key] = kvp.Value.ToString();
+            }
+        }
+
+        var parameters = new JsonObject
+        {
+            ["name"] = name,
+            ["arguments"] = argsNode
+        };
+
+        var response = await SendRequestAsync("tools/call", parameters, cancellationToken).ConfigureAwait(false);
+        return response; // Return the full result object directly
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_process is null)
+        {
+            return;
+        }
+
+        try
+        {
+            if (!_process.HasExited)
+            {
+                await SendRequestAsync("shutdown", new JsonObject(), CancellationToken.None).ConfigureAwait(false);
+            }
+        }
+        catch
+        {
+            // ignore disposal issues
+        }
+        finally
+        {
+            try
+            {
+                _stdin?.Dispose();
+                _stdout?.Dispose();
+            }
+            catch
+            {
+                // ignored
+            }
+
+            if (_process is { HasExited: false })
+            {
+                _process.Kill(true);
+            }
+
+            _process.Dispose();
+            _stderrDrainer = null;
+            _process = null;
+            _stdin = null;
+            _stdout = null;
+        }
+
+        await _mutex.WaitAsync().ConfigureAwait(false);
+        _mutex.Release();
+    }
+
+    private Task StartProcessAsync(CancellationToken cancellationToken)
+    {
+        var arguments = new StringBuilder();
+
+        var baseDirectory = _options.WorkingDirectory;
+        if (string.IsNullOrWhiteSpace(baseDirectory))
+        {
+            baseDirectory = AppContext.BaseDirectory;
+        }
+
+        if (!Path.IsPathFullyQualified(baseDirectory))
+        {
+            baseDirectory = Path.GetFullPath(baseDirectory, AppContext.BaseDirectory);
+        }
+
+        var assemblyPath = Path.IsPathFullyQualified(_options.AssemblyPath)
+            ? _options.AssemblyPath
+            : Path.GetFullPath(_options.AssemblyPath, baseDirectory);
+
+        var configPath = Path.IsPathFullyQualified(_options.ConfigPath)
+            ? _options.ConfigPath
+            : Path.GetFullPath(_options.ConfigPath, baseDirectory);
+
+        arguments.Append('"').Append(assemblyPath).Append('"');
+        arguments.Append(" mcp");
+        arguments.Append(" --config ").Append('"').Append(configPath).Append('"');
+        if (_options.RunId.HasValue)
+        {
+            arguments.Append(" --run-id ").Append(_options.RunId.Value);
+        }
+
+        var psi = new ProcessStartInfo
+        {
+            FileName = _options.DotnetExecutable,
+            Arguments = arguments.ToString(),
+            WorkingDirectory = baseDirectory,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+
+        // Copy Azure OpenAI environment variables to the subprocess
+        foreach (var key in Environment.GetEnvironmentVariables().Keys)
+        {
+            var keyStr = key?.ToString();
+            if (!string.IsNullOrEmpty(keyStr) && keyStr.StartsWith("AZURE_OPENAI", StringComparison.OrdinalIgnoreCase))
+            {
+                var value = Environment.GetEnvironmentVariable(keyStr);
+                if (!string.IsNullOrEmpty(value))
+                {
+                    psi.Environment[keyStr] = value;
+                }
+            }
+        }
+
+        _process = Process.Start(psi) ?? throw new InvalidOperationException("Failed to start MCP process");
+        _stdin = new StreamWriter(_process.StandardInput.BaseStream, new UTF8Encoding(false)) { AutoFlush = true };
+        _stdout = new StreamReader(_process.StandardOutput.BaseStream, new UTF8Encoding(false));
+
+        _stderrDrainer = Task.Run(async () =>
+        {
+            try
+            {
+                string? line;
+                while ((line = await _process.StandardError.ReadLineAsync().ConfigureAwait(false)) is not null)
+                {
+                    Console.Error.WriteLine($"[MCP] {line}");
+                }
+            }
+            catch
+            {
+                // ignore
+            }
+        }, cancellationToken);
+
+        _initialized = false;
+        return Task.CompletedTask;
+    }
+
+    private async Task InitializeAsync(CancellationToken cancellationToken)
+    {
+        var capabilities = await SendRequestAsync("initialize", new JsonObject(), cancellationToken).ConfigureAwait(false);
+        _initialized = true;
+    }
+
+    private async Task<JsonObject> SendRequestAsync(string method, JsonObject parameters, CancellationToken cancellationToken)
+    {
+        if (_stdin is null || _stdout is null)
+        {
+            throw new InvalidOperationException("MCP process is not running");
+        }
+
+        var id = Interlocked.Increment(ref _nextId);
+
+        var payload = new JsonObject
+        {
+            ["jsonrpc"] = "2.0",
+            ["id"] = id,
+            ["method"] = method
+        };
+
+        if (parameters.Count > 0)
+        {
+            payload["params"] = parameters;
+        }
+
+        var json = payload.ToJsonString();
+        var bytes = Encoding.UTF8.GetBytes(json);
+
+        await _sendLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await _stdin.WriteAsync($"Content-Length: {bytes.Length}\r\n\r\n").ConfigureAwait(false);
+            await _stdin.WriteAsync(json).ConfigureAwait(false);
+            await _stdin.FlushAsync().ConfigureAwait(false);
+
+            while (true)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var reply = await ReadResponseAsync(cancellationToken).ConfigureAwait(false);
+                if (reply is null)
+                {
+                    // If the MCP process died, stop spinning and surface an error so the caller can restart it.
+                    if (_process?.HasExited == true)
+                    {
+                        throw new InvalidOperationException("MCP process exited while waiting for a response.");
+                    }
+
+                    // Avoid a hot loop on malformed/empty frames.
+                    await Task.Delay(10, cancellationToken).ConfigureAwait(false);
+                    continue;
+                }
+
+                if (!reply.TryGetPropertyValue("id", out var responseIdNode) || responseIdNode is not JsonValue idValue)
+                {
+                    continue;
+                }
+
+                if (!idValue.TryGetValue<long>(out var responseId) || responseId != id)
+                {
+                    continue;
+                }
+
+                if (reply.TryGetPropertyValue("error", out var errorNode) && errorNode is JsonObject errorObj)
+                {
+                    var message = errorObj["message"]?.GetValue<string>() ?? "Unknown MCP error";
+                    throw new InvalidOperationException(message);
+                }
+
+                if (reply.TryGetPropertyValue("result", out var resultNode) && resultNode is JsonObject resultObj)
+                {
+                    return resultObj;
+                }
+
+                throw new InvalidOperationException("MCP response did not include a 'result' object");
+            }
+        }
+        finally
+        {
+            _sendLock.Release();
+        }
+    }
+
+    private async Task<JsonObject?> ReadResponseAsync(CancellationToken cancellationToken)
+    {
+        if (_stdout is null)
+        {
+            return null;
+        }
+
+        string? line;
+        Dictionary<string, string> headers = new(StringComparer.OrdinalIgnoreCase);
+        while ((line = await _stdout.ReadLineAsync().ConfigureAwait(false)) is not null)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (line.Length == 0)
+            {
+                break;
+            }
+
+            var index = line.IndexOf(':');
+            if (index <= 0)
+            {
+                continue;
+            }
+
+            headers[line[..index].Trim()] = line[(index + 1)..].Trim();
+        }
+
+        if (line is null)
+        {
+            return null;
+        }
+
+        if (!headers.TryGetValue("Content-Length", out var lengthValue) || !int.TryParse(lengthValue, out var contentLength))
+        {
+            return null;
+        }
+
+        var buffer = new char[contentLength];
+        var totalRead = 0;
+        while (totalRead < contentLength)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var read = await _stdout.ReadAsync(buffer, totalRead, contentLength - totalRead).ConfigureAwait(false);
+            if (read == 0)
+            {
+                return null;
+            }
+
+            totalRead += read;
+        }
+
+        var payload = new string(buffer, 0, contentLength);
+        using var document = JsonDocument.Parse(payload);
+        return JsonNode.Parse(document.RootElement.GetRawText())?.AsObject();
+    }
+}

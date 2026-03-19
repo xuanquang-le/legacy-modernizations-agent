@@ -1,0 +1,6 @@
+@CobolUploadApi_HostAddress = http://localhost:5044
+
+GET {{CobolUploadApi_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

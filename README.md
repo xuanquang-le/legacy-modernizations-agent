@@ -1,3 +1,18 @@
+tài liệu tự knowhow 
+https://docs.google.com/document/d/1j4pPcmbLTtKUjzWeWVgo3Zkxrn-qbLvFg03N6C249Gk/edit?usp=sharing
+
+
+
+
+
+
+
+
+
+
+
+
+
 <<<<<<< HEAD
 \# Thêm remote
 
